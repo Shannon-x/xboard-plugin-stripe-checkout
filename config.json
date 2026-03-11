@@ -1,0 +1,52 @@
+{
+    "name": "Stripe 一次性支付",
+    "code": "stripe_checkout",
+    "version": "1.0.0",
+    "description": "Stripe Checkout 一次性支付插件，支持手续费转嫁用户、自动汇率换算、Webhook 签名验证。",
+    "author": "Xboard",
+    "type": "payment",
+    "config": {
+        "stripe_sk_live": {
+            "type": "string",
+            "default": "",
+            "label": "Secret Key (SK)",
+            "description": "Stripe API 密钥（sk_live_ 或 sk_test_）"
+        },
+        "stripe_pk_live": {
+            "type": "string",
+            "default": "",
+            "label": "Publishable Key (PK)",
+            "description": "Stripe API 公钥（pk_live_ 或 pk_test_）"
+        },
+        "stripe_webhook_key": {
+            "type": "string",
+            "default": "",
+            "label": "Webhook 签名密钥",
+            "description": "Stripe Webhook 端点的签名密钥（whsec_）"
+        },
+        "currency": {
+            "type": "string",
+            "default": "cny",
+            "label": "结算货币",
+            "description": "Stripe 结算货币代码，如 cny、usd、hkd"
+        },
+        "fee_percent": {
+            "type": "number",
+            "default": 3.4,
+            "label": "手续费百分比 (%)",
+            "description": "Stripe 百分比手续费，如 3.4"
+        },
+        "fee_fixed_cents": {
+            "type": "number",
+            "default": 50,
+            "label": "固定手续费（分）",
+            "description": "Stripe 固定手续费，单位分。如 $0.50 = 50，¥3.50 = 350"
+        },
+        "exchange_rate": {
+            "type": "number",
+            "default": 1,
+            "label": "汇率（手续费换算）",
+            "description": "固定手续费的汇率换算。如固定费是美元而站点收人民币，填 7.2；同币种填 1"
+        }
+    }
+}
