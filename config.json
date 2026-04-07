@@ -1,8 +1,8 @@
 {
     "name": "Stripe 一次性支付",
     "code": "stripe_checkout",
-    "version": "1.0.0",
-    "description": "Stripe Checkout 一次性支付插件，支持手续费转嫁用户、自动汇率换算、Webhook 签名验证。",
+    "version": "1.1.0",
+    "description": "Stripe Checkout 一次性支付插件，支持多币种结算、手续费转嫁用户、Webhook 签名验证。",
     "author": "Xboard",
     "type": "payment",
     "config": {
@@ -28,25 +28,25 @@
             "type": "string",
             "default": "cny",
             "label": "结算货币",
-            "description": "Stripe 结算货币代码，如 cny、usd、hkd"
+            "description": "Stripe 结算货币代码，如 cny、usd、eur"
         },
         "fee_percent": {
             "type": "number",
             "default": 3.4,
             "label": "手续费百分比 (%)",
-            "description": "Stripe 百分比手续费，如 3.4"
+            "description": "Stripe 百分比手续费（如美国 2.9、欧洲 1.4、香港 3.4）"
         },
         "fee_fixed_cents": {
             "type": "number",
-            "default": 50,
-            "label": "固定手续费（分）",
-            "description": "Stripe 固定手续费，单位分。如 $0.50 = 50，¥3.50 = 350"
+            "default": 30,
+            "label": "固定手续费（结算货币最小单位）",
+            "description": "Stripe 固定手续费，单位为结算货币最小单位（USD: $0.30=30, EUR: €0.25=25, CNY: ¥3.50=350）"
         },
         "exchange_rate": {
             "type": "number",
             "default": 1,
-            "label": "汇率（手续费换算）",
-            "description": "固定手续费的汇率换算。如固定费是美元而站点收人民币，填 7.2；同币种填 1"
+            "label": "汇率（站点货币 → 结算货币）",
+            "description": "站点价格到 Stripe 结算货币的汇率。如站点 CNY、Stripe 收 USD: 1 USD=7.3 CNY 填 7.3；同币种填 1"
         }
     }
 }

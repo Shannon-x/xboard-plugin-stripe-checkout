@@ -53,19 +53,19 @@ class Plugin extends AbstractPlugin implements PaymentInterface
                 'label'       => '手续费百分比 (%)',
                 'type'        => 'string',
                 'default'     => '3.4',
-                'description' => 'Stripe 百分比手续费',
+                'description' => 'Stripe 百分比手续费（如美国 2.9、欧洲 1.4、香港 3.4）',
             ],
             'fee_fixed_cents' => [
-                'label'       => '固定手续费（分）',
+                'label'       => '固定手续费（结算货币最小单位）',
                 'type'        => 'string',
-                'default'     => '50',
-                'description' => '如 $0.50 = 50，¥3.50 = 350',
+                'default'     => '30',
+                'description' => 'Stripe 固定手续费，单位为结算货币最小单位（USD: $0.30=30, EUR: €0.25=25, CNY: ¥3.50=350）',
             ],
             'exchange_rate' => [
-                'label'       => '汇率',
+                'label'       => '汇率（站点货币 → 结算货币）',
                 'type'        => 'string',
                 'default'     => '1',
-                'description' => '固定手续费换算汇率',
+                'description' => '站点价格到 Stripe 结算货币的汇率。如站点 CNY、Stripe 收 USD: 1 USD=7.3 CNY 填 7.3；同币种填 1',
             ],
         ];
     }
@@ -80,7 +80,23 @@ class Plugin extends AbstractPlugin implements PaymentInterface
         Stripe::setApiKey($sk);
 
         $originalAmount = (int) $order['total_amount'];
-        $chargeAmount   = $this->addHandlingFee($originalAmount);
+
+        // 汇率换算：站点货币 → Stripe 结算货币
+        $exchangeRate = (float) $this->getConfig('exchange_rate', 1);
+        $convertedAmount = ($exchangeRate > 0 && $exchangeRate != 1)
+            ? (int) ceil($originalAmount / $exchangeRate)
+            : $originalAmount;
+
+        if ($exchangeRate != 1) {
+            \Log::info('[StripeCheckout] 汇率换算', [
+                'original'      => $originalAmount,
+                'exchange_rate' => $exchangeRate,
+                'converted'     => $convertedAmount,
+                'currency'      => $currency,
+            ]);
+        }
+
+        $chargeAmount = $this->addHandlingFee($convertedAmount);
 
         $params = [
             'mode'        => 'payment',
@@ -135,8 +151,8 @@ class Plugin extends AbstractPlugin implements PaymentInterface
         $sk         = $this->getConfig('stripe_sk_live');
         Stripe::setApiKey($sk);
 
-        $payload   = file_get_contents('php://input');
-        $sigHeader = $_SERVER['HTTP_STRIPE_SIGNATURE'] ?? '';
+        $payload   = $params['_raw_body'] ?? request()->getContent();
+        $sigHeader = $params['_stripe_signature'] ?? request()->header('Stripe-Signature', '');
 
         try {
             $event = \Stripe\Webhook::constructEvent($payload, $sigHeader, $webhookKey);
@@ -182,18 +198,21 @@ class Plugin extends AbstractPlugin implements PaymentInterface
 
     /**
      * 手续费反推：让用户承担 Stripe 手续费
-     * 公式：用户实付 = (原价 + 固定费 × 汇率) ÷ (1 - 百分比费率)
+     * 公式：用户实付 = (金额 + 固定费) ÷ (1 - 百分比费率)
+     * 注意：金额和固定费必须为同一货币的最小单位(cents/分)
      */
     private function addHandlingFee(int $amountCents): int
     {
         $feePercent    = (float) $this->getConfig('fee_percent', 3.4);
-        $feeFixedCents = (int) $this->getConfig('fee_fixed_cents', 50);
-        $exchangeRate  = (float) $this->getConfig('exchange_rate', 1);
+        $feeFixedCents = (int) $this->getConfig('fee_fixed_cents', 30);
 
-        $fixedInLocal = (int) round($feeFixedCents * $exchangeRate);
-        $rate         = $feePercent / 100;
+        if ($feePercent < 0 || $feePercent >= 100) {
+            \Log::warning('[StripeCheckout] fee_percent 超出合理范围，跳过手续费', ['fee_percent' => $feePercent]);
+            return $amountCents;
+        }
 
-        $total = ($amountCents + $fixedInLocal) / (1 - $rate);
+        $rate  = $feePercent / 100;
+        $total = ($amountCents + $feeFixedCents) / (1 - $rate);
 
         return (int) ceil($total);
     }

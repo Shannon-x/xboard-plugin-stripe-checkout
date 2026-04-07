@@ -48,7 +48,10 @@ class WebhookController extends Controller
             return response()->json(['error' => 'plugin not available'], 500);
         }
 
-        $result = $paymentPlugin->notify($request->all());
+        $result = $paymentPlugin->notify(array_merge($request->all(), [
+            '_raw_body'         => $request->getContent(),
+            '_stripe_signature' => $request->header('Stripe-Signature', ''),
+        ]));
 
         if ($result === false) {
             return response()->json(['error' => 'verification failed'], 400);
