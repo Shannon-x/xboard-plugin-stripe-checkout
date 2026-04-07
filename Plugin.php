@@ -114,13 +114,15 @@ class Plugin extends AbstractPlugin implements PaymentInterface
                 'quantity' => 1,
             ]],
             'metadata' => [
-                'trade_no' => $order['trade_no'],
-                'user_id'  => $order['user_id'],
+                'trade_no'        => $order['trade_no'],
+                'user_id'         => $order['user_id'],
+                'expected_amount' => (string) $chargeAmount,
             ],
             'payment_intent_data' => [
                 'metadata' => [
-                    'trade_no' => $order['trade_no'],
-                    'user_id'  => $order['user_id'],
+                    'trade_no'        => $order['trade_no'],
+                    'user_id'         => $order['user_id'],
+                    'expected_amount' => (string) $chargeAmount,
                 ],
             ],
         ];
@@ -129,7 +131,7 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             $session = Session::create($params);
         } catch (\Exception $e) {
             \Log::error('[StripeCheckout] 创建支付会话失败: ' . $e->getMessage());
-            throw new \App\Exceptions\ApiException('支付创建失败：' . $e->getMessage());
+            throw new \App\Exceptions\ApiException('支付创建失败，请稍后重试');
         }
 
         return [
@@ -141,9 +143,15 @@ class Plugin extends AbstractPlugin implements PaymentInterface
     /**
      * Stripe Webhook 验签 + 事件处理
      *
+     * 安全机制：
+     * 1. HMAC-SHA256 签名验证（Stripe SDK 内置，含 300s 时间窗口防重放）
+     * 2. Event ID 幂等检查（防止并发/重试导致重复开通）
+     * 3. 金额校验（验证实付金额 ≥ 创建时预期金额，防止配置篡改/异常）
+     *
      * 监听事件：
-     * - checkout.session.completed         首次支付成功（同步支付方式如信用卡）
-     * - checkout.session.async_payment_succeeded  异步支付成功（如银行转账）
+     * - checkout.session.completed              同步支付成功（信用卡等）
+     * - checkout.session.async_payment_succeeded 异步支付成功（银行转账等）
+     * - checkout.session.async_payment_failed    异步支付失败
      */
     public function notify($params): array|bool
     {
@@ -161,12 +169,23 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             return false;
         }
 
+        // 幂等检查：同一 Stripe 事件不重复处理
+        $eventKey = "stripe_checkout_evt:{$event->id}";
+        if (\Illuminate\Support\Facades\Cache::has($eventKey)) {
+            \Log::info('[StripeCheckout] 事件已处理，跳过', ['event_id' => $event->id]);
+            return ['custom_result' => response()->json(['received' => true], 200)];
+        }
+
         \Log::info('[StripeCheckout] Webhook event: ' . $event->type, ['id' => $event->id]);
 
         switch ($event->type) {
             case 'checkout.session.completed':
                 $session = $event->data->object;
                 if ($session->payment_status === 'paid') {
+                    if (!$this->verifyPaymentAmount($session)) {
+                        return false;
+                    }
+                    \Illuminate\Support\Facades\Cache::put($eventKey, true, 86400 * 7);
                     return [
                         'trade_no'      => $session->client_reference_id,
                         'callback_no'   => $session->payment_intent,
@@ -178,6 +197,10 @@ class Plugin extends AbstractPlugin implements PaymentInterface
 
             case 'checkout.session.async_payment_succeeded':
                 $session = $event->data->object;
+                if (!$this->verifyPaymentAmount($session)) {
+                    return false;
+                }
+                \Illuminate\Support\Facades\Cache::put($eventKey, true, 86400 * 7);
                 return [
                     'trade_no'      => $session->client_reference_id,
                     'callback_no'   => $session->payment_intent,
@@ -187,13 +210,53 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             case 'checkout.session.async_payment_failed':
                 $session = $event->data->object;
                 \Log::warning('[StripeCheckout] 异步支付失败', [
-                    'trade_no' => $session->client_reference_id,
+                    'trade_no'   => $session->client_reference_id,
+                    'session_id' => $session->id,
                 ]);
+                \Illuminate\Support\Facades\Cache::put($eventKey, true, 86400 * 7);
                 return ['custom_result' => response()->json(['received' => true], 200)];
 
             default:
                 return ['custom_result' => response()->json(['received' => true], 200)];
         }
+    }
+
+    /**
+     * 验证 Stripe 实际收款金额 ≥ 创建 Session 时的预期金额
+     * 预期金额在 pay() 中写入 metadata.expected_amount
+     *
+     * 策略：宁可漏过也不误杀
+     * - 双方金额都 > 0 且 actual < expected → 拒绝（真正的异常）
+     * - 任一方缺失或为 0 → 警告但放行（防止 API 变动导致误杀付款用户）
+     */
+    private function verifyPaymentAmount($session): bool
+    {
+        $expectedAmount = (int) ($session->metadata->expected_amount ?? 0);
+        $actualAmount   = (int) ($session->amount_total ?? 0);
+
+        // 缺少校验数据：警告但放行，不阻断用户
+        if ($expectedAmount <= 0 || $actualAmount <= 0) {
+            \Log::warning('[StripeCheckout] 金额校验跳过：缺少预期或实际金额', [
+                'trade_no'   => $session->client_reference_id,
+                'expected'   => $expectedAmount,
+                'actual'     => $actualAmount,
+                'session_id' => $session->id,
+            ]);
+            return true;
+        }
+
+        // 实付 < 预期：拒绝开通
+        if ($actualAmount < $expectedAmount) {
+            \Log::error('[StripeCheckout] 安全警告：支付金额低于预期，拒绝开通', [
+                'trade_no'   => $session->client_reference_id,
+                'expected'   => $expectedAmount,
+                'actual'     => $actualAmount,
+                'session_id' => $session->id,
+            ]);
+            return false;
+        }
+
+        return true;
     }
 
     /**
