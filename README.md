@@ -88,7 +88,7 @@ checkout.session.async_payment_failed
 | 结算货币 | Stripe 实际收款币种 | `usd` |
 | 手续费百分比 | Stripe 百分比费率 | `2.9` |
 | 固定手续费 | 结算货币最小单位 | `30`（$0.30） |
-| 汇率 | 站点货币 → 结算货币 | `7.3`（1 USD = 7.3 CNY） |
+| 固定汇率 | 站点 CNY → 结算货币 | 留空/`0` 自动获取，或填 `7.3`（1 USD = 7.3 CNY） |
 
 保存后将生成 UUID，用此 UUID 回到 Stripe Dashboard 完成 Webhook URL 配置。
 
@@ -121,7 +121,7 @@ tail -f storage/logs/laravel.log | grep StripeCheckout
 | 结算货币 | `usd` | |
 | 手续费百分比 | `2.9` | 美国 Stripe 标准费率 |
 | 固定手续费 | `30` | $0.30 = 30 cents |
-| 汇率 | `7.3` | 1 USD ≈ 7.3 CNY |
+| 固定汇率 | 留空或 `0` | 自动获取实时 CNY → USD 汇率；也可手动填 `7.3` |
 
 ### Stripe EUR（欧元结算）
 
@@ -130,7 +130,7 @@ tail -f storage/logs/laravel.log | grep StripeCheckout
 | 结算货币 | `eur` | |
 | 手续费百分比 | `1.4` | 欧洲经济区 Stripe 费率 |
 | 固定手续费 | `25` | €0.25 = 25 cents |
-| 汇率 | `7.7` | 1 EUR ≈ 7.7 CNY |
+| 固定汇率 | 留空或 `0` | 自动获取实时 CNY → EUR 汇率；也可手动填 `7.7` |
 
 ### Stripe CNY（人民币结算）
 
@@ -139,7 +139,7 @@ tail -f storage/logs/laravel.log | grep StripeCheckout
 | 结算货币 | `cny` | |
 | 手续费百分比 | `3.4` | 香港/大中华区费率 |
 | 固定手续费 | `350` | ¥3.50 = 350 分 |
-| 汇率 | `1` | 同币种 |
+| 固定汇率 | 留空或 `0` | 同币种自动按 1:1 处理 |
 
 > ⚠️ **重要**：每个支付方式实例需要独立的 Webhook 端点（不同 UUID），在 Stripe Dashboard 分别配置。
 
@@ -154,7 +154,7 @@ tail -f storage/logs/laravel.log | grep StripeCheckout
 ```
 输入：
   订单金额：10000 分 (¥100.00)
-  汇率：7.3 (1 USD = 7.3 CNY)
+  汇率：自动获取，示例按 1 USD = 7.3 CNY
   手续费：2.9% + $0.30
 
 计算：

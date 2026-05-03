@@ -3,6 +3,7 @@
 namespace Plugin\StripeCheckout;
 
 use App\Contracts\PaymentInterface;
+use App\Exceptions\ApiException;
 use App\Services\Plugin\AbstractPlugin;
 use Stripe\Stripe;
 use Stripe\Checkout\Session;
@@ -62,10 +63,10 @@ class Plugin extends AbstractPlugin implements PaymentInterface
                 'description' => 'Stripe 固定手续费，单位为结算货币最小单位（USD: $0.30=30, EUR: €0.25=25, CNY: ¥3.50=350）',
             ],
             'exchange_rate' => [
-                'label'       => '汇率（站点货币 → 结算货币）',
+                'label'       => '固定汇率（留空自动获取）',
                 'type'        => 'string',
-                'default'     => '1',
-                'description' => '站点价格到 Stripe 结算货币的汇率。如站点 CNY、Stripe 收 USD: 1 USD=7.3 CNY 填 7.3；同币种填 1',
+                'default'     => '',
+                'description' => '站点 CNY 到 Stripe 结算货币的固定汇率。如 Stripe 收 USD 且 1 USD=7.3 CNY 填 7.3；留空或填 0 自动获取实时汇率',
             ],
         ];
     }
@@ -79,22 +80,10 @@ class Plugin extends AbstractPlugin implements PaymentInterface
         $currency = strtolower($this->getConfig('currency', 'cny'));
         Stripe::setApiKey($sk);
 
+        $tradeNo = $this->normalizeTradeNo($order['trade_no'] ?? '');
+
         $originalAmount = (int) $order['total_amount'];
-
-        // 汇率换算：站点货币 → Stripe 结算货币
-        $exchangeRate = (float) $this->getConfig('exchange_rate', 1);
-        $convertedAmount = ($exchangeRate > 0 && $exchangeRate != 1)
-            ? (int) ceil($originalAmount / $exchangeRate)
-            : $originalAmount;
-
-        if ($exchangeRate != 1) {
-            \Log::info('[StripeCheckout] 汇率换算', [
-                'original'      => $originalAmount,
-                'exchange_rate' => $exchangeRate,
-                'converted'     => $convertedAmount,
-                'currency'      => $currency,
-            ]);
-        }
+        $convertedAmount = $this->convertAmount($originalAmount, $currency);
 
         $chargeAmount = $this->addHandlingFee($convertedAmount);
 
@@ -102,25 +91,25 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             'mode'        => 'payment',
             'success_url' => $order['return_url'],
             'cancel_url'  => $order['return_url'],
-            'client_reference_id' => $order['trade_no'],
+            'client_reference_id' => $tradeNo,
             'line_items' => [[
                 'price_data' => [
                     'currency'     => $currency,
                     'unit_amount'  => $chargeAmount,
                     'product_data' => [
-                        'name' => 'Xboard - ' . $order['trade_no'],
+                        'name' => $tradeNo,
                     ],
                 ],
                 'quantity' => 1,
             ]],
             'metadata' => [
-                'trade_no'        => $order['trade_no'],
+                'trade_no'        => $tradeNo,
                 'user_id'         => $order['user_id'],
                 'expected_amount' => (string) $chargeAmount,
             ],
             'payment_intent_data' => [
                 'metadata' => [
-                    'trade_no'        => $order['trade_no'],
+                    'trade_no'        => $tradeNo,
                     'user_id'         => $order['user_id'],
                     'expected_amount' => (string) $chargeAmount,
                 ],
@@ -260,6 +249,23 @@ class Plugin extends AbstractPlugin implements PaymentInterface
     }
 
     /**
+     * 部分环境 / 旧版核心会在支付参数里给 trade_no 加上「Xboard - 」展示前缀；
+     * Stripe 行项目名与 client_reference_id 必须与库里的订单号一致，故统一剥掉此前缀。
+     */
+    private function normalizeTradeNo(mixed $tradeNo): string
+    {
+        $s = trim((string) $tradeNo);
+        if ($s === '') {
+            return '';
+        }
+        if (preg_match('/^Xboard\s*-\s*(.+)$/iu', $s, $m)) {
+            return trim($m[1]);
+        }
+
+        return $s;
+    }
+
+    /**
      * 手续费反推：让用户承担 Stripe 手续费
      * 公式：用户实付 = (金额 + 固定费) ÷ (1 - 百分比费率)
      * 注意：金额和固定费必须为同一货币的最小单位(cents/分)
@@ -278,5 +284,76 @@ class Plugin extends AbstractPlugin implements PaymentInterface
         $total = ($amountCents + $feeFixedCents) / (1 - $rate);
 
         return (int) ceil($total);
+    }
+
+    /**
+     * Xboard 站点价格按 CNY 分保存；Stripe 需要目标币种最小单位金额。
+     * exchange_rate 填大于 0 时使用固定汇率，留空/0 时自动获取 CNY -> 目标币种汇率。
+     */
+    private function convertAmount(int $amountCents, string $currency): int
+    {
+        if ($amountCents <= 0) {
+            throw new ApiException('订单金额不能为 0', 400);
+        }
+
+        $customExchangeRate = (float) $this->getConfig('exchange_rate', 0);
+        if ($customExchangeRate > 0) {
+            $convertedAmount = $customExchangeRate == 1.0
+                ? $amountCents
+                : (int) ceil($amountCents / $customExchangeRate);
+
+            $this->logExchange('manual', $amountCents, $convertedAmount, $currency, $customExchangeRate);
+            return max(1, $convertedAmount);
+        }
+
+        $exchange = $this->exchange('CNY', $currency);
+        if (!$exchange) {
+            throw new ApiException('在线汇率转换服务未响应，请联系管理在后台设定固定汇率', 500);
+        }
+
+        $convertedAmount = (int) ceil($amountCents * $exchange);
+        $this->logExchange('auto', $amountCents, $convertedAmount, $currency, $exchange);
+
+        return max(1, $convertedAmount);
+    }
+
+    private function logExchange(string $mode, int $originalAmount, int $convertedAmount, string $currency, float $exchangeRate): void
+    {
+        if ($currency === 'cny' && $convertedAmount === $originalAmount) {
+            return;
+        }
+
+        \Log::info('[StripeCheckout] 汇率换算', [
+            'mode'          => $mode,
+            'original'      => $originalAmount,
+            'exchange_rate' => $exchangeRate,
+            'converted'     => $convertedAmount,
+            'currency'      => $currency,
+        ]);
+    }
+
+    private function exchange(string $from, string $to): ?float
+    {
+        if (strtoupper($from) === strtoupper($to)) {
+            return 1.0;
+        }
+
+        $from = strtolower($from);
+        $to = strtolower($to);
+
+        try {
+            $result = @file_get_contents(
+                "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/{$from}.min.json"
+            );
+
+            if (!is_string($result) || $result === '') {
+                return null;
+            }
+
+            $decoded = json_decode($result, true);
+            return isset($decoded[$from][$to]) ? (float) $decoded[$from][$to] : null;
+        } catch (\Throwable $e) {
+            return null;
+        }
     }
 }

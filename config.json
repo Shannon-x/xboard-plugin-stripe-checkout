@@ -44,9 +44,9 @@
         },
         "exchange_rate": {
             "type": "number",
-            "default": 1,
-            "label": "汇率（站点货币 → 结算货币）",
-            "description": "站点价格到 Stripe 结算货币的汇率。如站点 CNY、Stripe 收 USD: 1 USD=7.3 CNY 填 7.3；同币种填 1"
+            "default": 0,
+            "label": "固定汇率（留空自动获取）",
+            "description": "站点 CNY 到 Stripe 结算货币的固定汇率。如 Stripe 收 USD 且 1 USD=7.3 CNY 填 7.3；留空或填 0 自动获取实时汇率"
         }
     }
 }
