@@ -346,12 +346,31 @@ class Plugin extends AbstractPlugin implements PaymentInterface
                 "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/{$from}.min.json"
             );
 
+            if (is_string($result) && $result !== '') {
+                $decoded = json_decode($result, true);
+                if (isset($decoded[$from][$to])) {
+                    return (float) $decoded[$from][$to];
+                }
+            }
+        } catch (\Throwable $e) {
+            // Try the backup provider below.
+        }
+
+        return $this->exchangeFromBackup($from, $to);
+    }
+
+    private function exchangeFromBackup(string $from, string $to): ?float
+    {
+        try {
+            $result = @file_get_contents('https://api.exchangerate-api.com/v4/latest/' . strtoupper($from));
             if (!is_string($result) || $result === '') {
                 return null;
             }
 
             $decoded = json_decode($result, true);
-            return isset($decoded[$from][$to]) ? (float) $decoded[$from][$to] : null;
+            $to = strtoupper($to);
+
+            return isset($decoded['rates'][$to]) ? (float) $decoded['rates'][$to] : null;
         } catch (\Throwable $e) {
             return null;
         }
