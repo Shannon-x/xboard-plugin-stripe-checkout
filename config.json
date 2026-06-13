@@ -1,8 +1,8 @@
 {
     "name": "Stripe 一次性支付",
     "code": "stripe_checkout",
-    "version": "1.1.0",
-    "description": "Stripe Checkout 一次性支付插件，支持多币种结算、手续费转嫁用户、Webhook 签名验证。",
+    "version": "1.2.0",
+    "description": "Stripe Checkout 一次性支付插件，支持多币种结算、手续费转嫁用户、Webhook 签名验证、共享账户事件隔离与入账失败自动重试。",
     "author": "Xboard",
     "type": "payment",
     "config": {
@@ -28,7 +28,7 @@
             "type": "string",
             "default": "cny",
             "label": "结算货币",
-            "description": "Stripe 结算货币代码，如 cny、usd、eur"
+            "description": "Stripe 结算货币代码，如 cny、usd、eur、jpy（零小数与三位小数货币已自动按 Stripe 规则换算）"
         },
         "fee_percent": {
             "type": "number",
@@ -46,7 +46,7 @@
             "type": "number",
             "default": 0,
             "label": "固定汇率（留空自动获取）",
-            "description": "站点 CNY 到 Stripe 结算货币的固定汇率。如 Stripe 收 USD 且 1 USD=7.3 CNY 填 7.3；留空或填 0 自动获取实时汇率"
+            "description": "1 个 Stripe 结算货币单位等于多少 CNY。如 Stripe 收 USD 且 1 USD=7.3 CNY 填 7.3；留空或填 0 自动获取实时汇率。日志中 fixed_rate_hint 字段给出的就是此处应填的值"
         }
     }
 }
