@@ -5,6 +5,7 @@ namespace Plugin\StripeCheckout;
 use App\Contracts\PaymentInterface;
 use App\Exceptions\ApiException;
 use App\Services\Plugin\AbstractPlugin;
+use Plugin\StripeCheckout\Services\CardTestingGuard;
 use Stripe\Stripe;
 use Stripe\Checkout\Session;
 
@@ -73,7 +74,7 @@ class Plugin extends AbstractPlugin implements PaymentInterface
                 'type'        => 'string',
                 'default'     => $webhookUrl,
                 'description' => $uuid
-                    ? '请将此地址原样配置到 Stripe Dashboard → 开发者 → Webhooks 端点。监听事件：checkout.session.completed、checkout.session.async_payment_succeeded、checkout.session.async_payment_failed'
+                    ? '请将此地址原样配置到 Stripe Dashboard → 开发者 → Webhooks 端点。监听事件：checkout.session.completed、checkout.session.async_payment_succeeded、checkout.session.async_payment_failed、payment_intent.payment_failed（最后一项是试卡防护的失败计数来源，必须勾选）'
                     : '请先保存支付方式，保存后此处将自动生成 Webhook URL',
             ],
             'currency' => [
@@ -100,11 +101,68 @@ class Plugin extends AbstractPlugin implements PaymentInterface
                 'default'     => '',
                 'description' => '1 个 Stripe 结算货币单位等于多少 CNY。如 Stripe 收 USD 且 1 USD=7.3 CNY 填 7.3；留空或填 0 自动获取实时汇率。注意：日志里 fixed_rate_hint 字段给出的就是此处应填的值',
             ],
+            'session_expire_minutes' => [
+                'label'       => '支付会话有效期（分钟）',
+                'type'        => 'string',
+                'default'     => '31',
+                'description' => 'Checkout 页面的存活时间，越短试卡窗口越小。Stripe 下限 30 分钟，建议保持默认',
+            ],
+            'guard_user_hourly' => [
+                'label'       => '试卡防护：单账户每小时会话上限',
+                'type'        => 'string',
+                'default'     => '4',
+                'description' => '同一账户每小时最多创建的支付会话数（同一订单复用会话不计数）。0 关闭',
+            ],
+            'guard_ip_hourly' => [
+                'label'       => '试卡防护：单 IP 每小时会话上限',
+                'type'        => 'string',
+                'default'     => '8',
+                'description' => '同一 IP 每小时最多创建的支付会话数，防批量小号。0 关闭',
+            ],
+            'guard_fail_threshold' => [
+                'label'       => '试卡防护：失败封禁阈值',
+                'type'        => 'string',
+                'default'     => '3',
+                'description' => '账户 24 小时内支付失败达到此次数即封禁其 Stripe 支付（支付成功会清零计数）。0 关闭',
+            ],
+            'guard_fail_threshold_new' => [
+                'label'       => '试卡防护：新账户失败封禁阈值',
+                'type'        => 'string',
+                'default'     => '2',
+                'description' => '新注册账户适用的更严阈值（试卡机器人从注册到下单只需几秒）。0 关闭',
+            ],
+            'guard_new_account_hours' => [
+                'label'       => '试卡防护：新账户定义（小时）',
+                'type'        => 'string',
+                'default'     => '24',
+                'description' => '注册不足此小时数视为新账户。0 表示不区分新旧账户',
+            ],
+            'guard_block_hours' => [
+                'label'       => '试卡防护：封禁时长（小时）',
+                'type'        => 'string',
+                'default'     => '72',
+                'description' => '账户命中失败阈值后禁止使用 Stripe 支付的时长；封禁期间继续失败会自动续期',
+            ],
+            'guard_global_fail_hourly' => [
+                'label'       => '试卡防护：全站熔断阈值（次/小时）',
+                'type'        => 'string',
+                'default'     => '12',
+                'description' => '全站 1 小时内支付失败达到此次数即临时暂停 Stripe 通道并通知管理员（Telegram）。0 关闭',
+            ],
+            'guard_pause_minutes' => [
+                'label'       => '试卡防护：熔断暂停时长（分钟）',
+                'type'        => 'string',
+                'default'     => '30',
+                'description' => '熔断触发后暂停 Stripe 支付的时长，攻击停止后自动恢复',
+            ],
         ];
     }
 
     /**
      * 创建 Stripe Checkout Session（一次性支付模式）
+     *
+     * 试卡防护（CardTestingGuard，详见 Services/CardTestingGuard.php 类注释）：
+     * 封禁/熔断准入 → 同订单会话复用 → 单账户/单 IP 频率限制 → 短过期会话。
      */
     public function pay($order): array
     {
@@ -113,6 +171,7 @@ class Plugin extends AbstractPlugin implements PaymentInterface
         Stripe::setApiKey($sk);
 
         $tradeNo = $this->normalizeTradeNo($order['trade_no'] ?? '');
+        $userId  = (int) ($order['user_id'] ?? 0);
 
         $originalAmount = (int) $order['total_amount'];
         // 转换为目标货币的最小单位（零小数/三位小数货币按 Stripe 规则归一化）
@@ -121,11 +180,33 @@ class Plugin extends AbstractPlugin implements PaymentInterface
         $chargeAmount = $this->addHandlingFee($convertedAmount);
         $chargeAmount = $this->roundForStripe($chargeAmount, $currency);
 
+        // 封禁/熔断准入放在会话复用之前：被封账户连缓存的旧会话 URL 也拿不到
+        $guard = $this->guard();
+        $guard->assertAllowed($userId);
+
+        // 同一订单复用未过期会话：反复点击「去支付」不再新建（不消耗频率额度）
+        if ($cachedUrl = $guard->cachedSessionUrl($tradeNo, $chargeAmount)) {
+            return ['type' => 1, 'data' => $cachedUrl];
+        }
+
+        $clientIp = $this->clientIp();
+        $guard->assertWithinRateLimits($userId, $clientIp);
+
+        $expiresAt = time() + $this->sessionLifetimeSeconds();
+        $metadata = [
+            'trade_no'        => $tradeNo,
+            'user_id'         => $order['user_id'],
+            'expected_amount' => (string) $chargeAmount,
+            'client_ip'       => (string) ($clientIp ?? ''),
+        ];
+
         $params = [
             'mode'        => 'payment',
             'success_url' => $order['return_url'],
             'cancel_url'  => $order['return_url'],
             'client_reference_id' => $tradeNo,
+            // 短过期会话：默认 31 分钟（Stripe 下限 30），大幅缩短单个会话可被试卡的窗口
+            'expires_at'  => $expiresAt,
             'line_items' => [[
                 'price_data' => [
                     'currency'     => $currency,
@@ -136,19 +217,18 @@ class Plugin extends AbstractPlugin implements PaymentInterface
                 ],
                 'quantity' => 1,
             ]],
-            'metadata' => [
-                'trade_no'        => $tradeNo,
-                'user_id'         => $order['user_id'],
-                'expected_amount' => (string) $chargeAmount,
-            ],
+            'metadata' => $metadata,
             'payment_intent_data' => [
-                'metadata' => [
-                    'trade_no'        => $tradeNo,
-                    'user_id'         => $order['user_id'],
-                    'expected_amount' => (string) $chargeAmount,
-                ],
+                'metadata' => $metadata,
             ],
         ];
+
+        // 锁定收款邮箱为面板账户邮箱：试卡脚本无法再随意填写邮箱，
+        // 同时给 Radar 提供稳定的 email 关联信号
+        $user = $this->findUser($userId);
+        if ($user && !empty($user->email) && filter_var($user->email, FILTER_VALIDATE_EMAIL)) {
+            $params['customer_email'] = $user->email;
+        }
 
         try {
             $session = Session::create($params);
@@ -156,6 +236,8 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             \Log::error('[StripeCheckout] 创建支付会话失败: ' . $e->getMessage());
             throw new \App\Exceptions\ApiException('支付创建失败，请稍后重试');
         }
+
+        $guard->rememberSession($tradeNo, $userId, $session->id, $session->url, $chargeAmount, (int) ($session->expires_at ?? $expiresAt));
 
         return [
             'type' => 1,
@@ -180,6 +262,8 @@ class Plugin extends AbstractPlugin implements PaymentInterface
      * - checkout.session.completed              同步支付成功（信用卡等）
      * - checkout.session.async_payment_succeeded 异步支付成功（银行转账等）
      * - checkout.session.async_payment_failed    异步支付失败
+     * - payment_intent.payment_failed            单次卡尝试失败（试卡防护计数，需在
+     *   Stripe Dashboard 的 Webhook 端点上追加监听此事件）
      */
     public function notify($params): array|bool
     {
@@ -239,6 +323,9 @@ class Plugin extends AbstractPlugin implements PaymentInterface
                     return false;
                 }
 
+                // 支付成功：清零该账户的试卡失败计数，避免偶发拒付的正常用户被累积误封
+                $this->guard()->recordSuccess((int) ($session->metadata->user_id ?? 0));
+
                 return [
                     'trade_no'      => $tradeNo,
                     'callback_no'   => $session->payment_intent ?: $session->id,
@@ -256,8 +343,152 @@ class Plugin extends AbstractPlugin implements PaymentInterface
                 \Illuminate\Support\Facades\Cache::put($eventKey, true, 86400 * 7);
                 return ['custom_result' => response()->json(['received' => true], 200)];
 
+            case 'payment_intent.payment_failed':
+                return $this->handleFailedAttempt($event, $eventKey);
+
             default:
                 return ['custom_result' => response()->json(['received' => true], 200)];
+        }
+    }
+
+    /**
+     * 试卡防护：处理 payment_intent.payment_failed（每一次卡尝试失败都会触发一条）。
+     *
+     * 共享 Stripe 账户下，其它产品的 PaymentIntent 失败事件也会推到本端点，
+     * 通过 metadata.trade_no 归属判定隔离——非本插件创建的一律确认（200）但不计数。
+     */
+    private function handleFailedAttempt(\Stripe\Event $event, string $eventKey): array
+    {
+        $pi      = $event->data->object;
+        $tradeNo = $pi->metadata->trade_no ?? null;
+
+        if ($tradeNo) {
+            $userId      = (int) ($pi->metadata->user_id ?? 0);
+            $declineCode = $pi->last_payment_error->decline_code
+                ?? $pi->last_payment_error->code
+                ?? 'unknown';
+
+            $result = $this->guard()->recordFailure($userId, $this->isNewAccount($userId));
+
+            \Log::warning('[StripeCheckout] 支付尝试失败（试卡防护计数）', [
+                'trade_no'     => $tradeNo,
+                'user_id'      => $userId,
+                'decline'      => $declineCode,
+                'user_fails'   => $result['fails'],
+                'global_fails' => $result['global'],
+            ]);
+
+            if ($result['blocked']) {
+                $expired = $this->expireUserSessions($userId);
+                if ($result['blockedNow']) {
+                    $blockHours = (int) $this->getConfig('guard_block_hours', 72);
+                    $msg = "⚠️ Stripe 试卡防护：用户 #{$userId} 在 24 小时内支付失败 {$result['fails']} 次，"
+                        . "已封禁其 Stripe 支付 {$blockHours} 小时，并过期其名下 {$expired} 个未完成支付会话。"
+                        . "订单 {$tradeNo}，拒绝码 {$declineCode}。";
+                    \Log::error('[StripeCheckout] ' . $msg);
+                    $this->notifyAdmin($msg);
+                }
+            }
+
+            if ($result['pausedNow']) {
+                $pauseMinutes = (int) $this->getConfig('guard_pause_minutes', 30);
+                $msg = "🚨 Stripe 试卡防护熔断：最近 1 小时全站支付失败已达 {$result['global']} 次，"
+                    . "疑似遭受 card testing 攻击，已暂停 Stripe 支付通道 {$pauseMinutes} 分钟。"
+                    . "请到 Stripe Dashboard → Payments 核实，并检查 Radar 规则。";
+                \Log::error('[StripeCheckout] ' . $msg);
+                $this->notifyAdmin($msg);
+            }
+        }
+
+        \Illuminate\Support\Facades\Cache::put($eventKey, true, 86400 * 7);
+        return ['custom_result' => response()->json(['received' => true], 200)];
+    }
+
+    /**
+     * 过期指定用户名下所有被跟踪的未完成 Checkout Session，阻断封禁后继续在
+     * 已打开的支付页面上试卡。返回实际过期的会话数。
+     */
+    private function expireUserSessions(int $userId): int
+    {
+        $count = 0;
+        foreach ($this->guard()->pullUserSessions($userId) as $item) {
+            try {
+                $session = Session::retrieve($item['id']);
+                if ($session->status === 'open') {
+                    $session->expire();
+                    $count++;
+                }
+            } catch (\Throwable $e) {
+                // 已过期/已完成的会话无法 expire，忽略
+            }
+        }
+        return $count;
+    }
+
+    private function guard(): CardTestingGuard
+    {
+        return new CardTestingGuard(
+            userHourly:       (int) $this->getConfig('guard_user_hourly', 4),
+            ipHourly:         (int) $this->getConfig('guard_ip_hourly', 8),
+            failThreshold:    (int) $this->getConfig('guard_fail_threshold', 3),
+            failThresholdNew: (int) $this->getConfig('guard_fail_threshold_new', 2),
+            blockHours:       (int) $this->getConfig('guard_block_hours', 72),
+            globalFailHourly: (int) $this->getConfig('guard_global_fail_hourly', 12),
+            pauseMinutes:     (int) $this->getConfig('guard_pause_minutes', 30),
+        );
+    }
+
+    /**
+     * 注册不足 N 小时视为新账户，适用更低的失败封禁阈值。
+     * 本站实测攻击账号从注册到下单仅隔 2~4 秒。
+     */
+    private function isNewAccount(int $userId): bool
+    {
+        $hours = (int) $this->getConfig('guard_new_account_hours', 24);
+        if ($hours <= 0) {
+            return false;
+        }
+        $user = $this->findUser($userId);
+        return $user && (time() - (int) $user->created_at) < $hours * 3600;
+    }
+
+    private function findUser(int $userId): mixed
+    {
+        if ($userId <= 0) {
+            return null;
+        }
+        try {
+            return \App\Models\User::find($userId);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /** pay() 可能被非 HTTP 上下文调用（如队列），拿不到 IP 时按 IP 的限制自动跳过 */
+    private function clientIp(): ?string
+    {
+        try {
+            return request()?->ip();
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /** Checkout Session 有效期，Stripe 要求 expires_at 距创建至少 30 分钟 */
+    private function sessionLifetimeSeconds(): int
+    {
+        $minutes = (int) $this->getConfig('session_expire_minutes', 31);
+        return min(1440, max(31, $minutes)) * 60;
+    }
+
+    private function notifyAdmin(string $message): void
+    {
+        try {
+            if (class_exists(\App\Services\TelegramService::class)) {
+                (new \App\Services\TelegramService())->sendMessageWithAdmin($message);
+            }
+        } catch (\Throwable $e) {
+            \Log::warning('[StripeCheckout] 管理员通知发送失败: ' . $e->getMessage());
         }
     }
 

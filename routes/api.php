@@ -14,6 +14,7 @@ use Plugin\StripeCheckout\Controllers\WebhookController;
 |   - checkout.session.completed
 |   - checkout.session.async_payment_succeeded
 |   - checkout.session.async_payment_failed
+|   - payment_intent.payment_failed   （试卡防护失败计数，必须勾选）
 |
 */
 

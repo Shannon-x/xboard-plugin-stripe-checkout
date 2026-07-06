@@ -11,6 +11,7 @@
 - ✅ Webhook HMAC-SHA256 签名验证
 - ✅ Event ID 幂等检查（防止并发/重试导致重复开通）
 - ✅ 服务端金额校验（防止配置异常导致低价开通）
+- ✅ Card testing 试卡防护（失败封禁 / 全局熔断 / 账户与 IP 频率限制 / 会话复用 / 短过期会话）
 - ✅ 支持同步支付（信用卡）和异步支付（银行转账等）
 - ✅ 3D Secure 自动适配（由 Stripe 风控引擎决定）
 - ✅ Octane（Swoole / RoadRunner）运行时兼容
@@ -62,13 +63,17 @@ https://你的域名/api/v1/guest/payment/stripe-checkout-webhook/{uuid}
 
 > 其中 `{uuid}` 是在 Xboard 后台保存支付方式后自动生成的 UUID。先完成第三步保存后，回来填写此 URL。
 
-3. 选择监听事件（**仅勾选以下 3 个，不要多选**）：
+3. 选择监听事件（**仅勾选以下 4 个，不要多选**）：
 
 ```
 checkout.session.completed
 checkout.session.async_payment_succeeded
 checkout.session.async_payment_failed
+payment_intent.payment_failed
 ```
+
+> `payment_intent.payment_failed` 是试卡防护（失败封禁 / 全局熔断）的失败计数来源，
+> 不勾选则这两层防护不会生效（频率限制与会话复用仍然有效）。
 
 4. 点击 **Add endpoint** 创建
 5. 进入新创建的 Webhook 详情页，点击 **Reveal signing secret**
@@ -214,7 +219,30 @@ Stripe 发送 Webhook → 插件验签
 
 3DS 验证完全由 Stripe Checkout 页面在 Stripe 侧执行，不经过你的服务器。触发条件由 Stripe Radar 风控引擎和发卡行 SCA 规则决定，无法从插件侧绕过。
 
-### 5. 防御纵深
+### 5. Card testing 试卡防护（v1.3.0+）
+
+针对「批量注册小号 → 创建小额订单 → 在 Checkout 页面轮换盗刷卡试卡」的攻击
+（每次卡尝试都会被 Stripe Radar 按次计费，失败也烧钱），插件内置五层防护：
+
+| 层 | 机制 | 相关配置（默认值） |
+|----|------|--------------------|
+| 账户封禁 | 24h 内支付失败达到阈值即禁用该账户的 Stripe 支付，并立即过期其名下全部未完成会话；支付成功清零计数 | 阈值 `3`（新账户 `2`），封禁 `72` 小时 |
+| 全局熔断 | 全站 1 小时失败数超阈值即整体暂停通道并 Telegram 通知管理员，到期自动恢复 | 阈值 `12` 次/小时，暂停 `30` 分钟 |
+| 频率限制 | 单账户 / 单 IP 每小时创建会话数上限 | 账户 `4`，IP `8` |
+| 会话复用 | 同一订单在有效期内复用同一 Checkout Session，反复点击不再新建 | 自动 |
+| 短过期会话 | Session 有效期从 Stripe 默认 24 小时压缩到 31 分钟，并锁定 `customer_email` 为面板账户邮箱 | `31` 分钟 |
+
+依赖：Webhook 端点必须监听 `payment_intent.payment_failed`（见「配置 Webhook」）。
+所有阈值填 `0` 可单独关闭对应防护层。
+
+**建议配合 Stripe Radar 规则**（Dashboard → Radar → Rules）：
+
+```
+Block if :cvc_check: = 'fail'
+Request 3D Secure if :risk_level: = 'elevated'
+```
+
+### 6. 防御纵深
 
 | 层级 | 防护 |
 |------|------|
@@ -224,6 +252,7 @@ Stripe 发送 Webhook → 插件验签
 | 状态层 | `ORDER_PENDING` 状态检查（双重：Controller + OrderService） |
 | 幂等层 | Event ID 缓存去重 |
 | 应用层 | 3DS 由 Stripe 侧强制执行 |
+| 风控层 | 试卡防护（封禁 / 熔断 / 限速 / 会话复用） |
 
 ---
 
